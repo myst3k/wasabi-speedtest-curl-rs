@@ -35,13 +35,15 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Rename binary
-        run: cp target/${{ matrix.target }}/release/wasabi-speedtest-curl ${{ matrix.artifact }}
+      - name: Package tarball
+        run: |
+          cp target/${{ matrix.target }}/release/wasabi-speedtest-curl .
+          tar czf ${{ matrix.artifact }}-${{ github.ref_name }}.tar.gz wasabi-speedtest-curl
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}-${{ github.ref_name }}.tar.gz
 
   release:
     needs: build
@@ -55,4 +57,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: wasabi-speedtest-curl-*
+          files: "*.tar.gz"
