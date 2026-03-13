@@ -37,6 +37,10 @@ curl -s -o /dev/null \
 
 ## Install
 
+Download a prebuilt binary from [Releases](https://github.com/myst3k/wasabi-speedtest-curl-rs/releases) (linux-amd64, macos-amd64, macos-arm64).
+
+Or build from source:
+
 ```bash
 cargo build --release
 # Binary at: target/release/wasabi-speedtest-curl
