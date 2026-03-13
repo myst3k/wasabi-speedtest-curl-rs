@@ -1,0 +1,13 @@
+[package]
+name = "wasabi-speedtest-curl"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+ctrlc = "3"
+rand = "0.9"
+chrono = "0.4"
+dotenvy = "0.15"
+envconfig = "0.10"
