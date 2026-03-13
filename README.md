@@ -1,6 +1,6 @@
 # wasabi-speedtest-curl
 
-Wasabi S3 connectivity diagnostic tool. Runs repeated uploads and/or downloads against a Wasabi bucket, measuring transfer time, throughput, and capturing diagnostic response headers.
+Wasabi S3 connectivity diagnostic tool. Loops synchronous curl uploads and/or downloads against a Wasabi bucket — indefinitely or for a set number of runs. Generates random payloads in memory (configurable size: 1MB, 10MB default, 100MB, etc.) so there's nothing to carry or pre-stage. Measures transfer time, throughput, and captures diagnostic response headers for every run.
 
 Single static binary, no runtime dependencies beyond `curl >= 7.75`.
 
