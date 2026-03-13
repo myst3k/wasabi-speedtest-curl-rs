@@ -38,12 +38,12 @@ jobs:
       - name: Package tarball
         run: |
           cp target/${{ matrix.target }}/release/wasabi-speedtest-curl .
-          tar czf ${{ matrix.artifact }}-${{ github.ref_name }}.tar.gz wasabi-speedtest-curl
+          tar czf ${{ matrix.artifact }}.tar.gz wasabi-speedtest-curl
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}-${{ github.ref_name }}.tar.gz
+          path: ${{ matrix.artifact }}.tar.gz
 
   release:
     needs: build
