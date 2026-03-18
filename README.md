@@ -8,6 +8,33 @@ Single static binary, no runtime dependencies beyond `curl >= 7.75`.
 
 The tool intentionally shells out to `curl` for transfers (rather than using an HTTP library) so transfer behavior is identical to what users experience and is diagnosable with pcap. Uploads pipe random data to `curl -T -` from memory — no test file needed.
 
+### Reference curl commands
+
+**Upload:**
+```bash
+curl -s -o /dev/null \
+  -w "%{http_code}\n%{remote_ip}" \
+  -D /dev/stderr \
+  -A "wasabi-speedtest-curl-rs/0.1" \
+  --aws-sigv4 "aws:amz:us-east-1:s3" \
+  --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
+  --max-time 200 \
+  -X PUT -T - \
+  "https://s3.wasabisys.com/BUCKET/speedtest-YYYYMMDDHHMMSS-N-RAND.bin"
+```
+
+**Download:**
+```bash
+curl -s -o /dev/null \
+  -w "%{http_code}\n%{remote_ip}" \
+  -D /dev/stderr \
+  -A "wasabi-speedtest-curl-rs/0.1" \
+  --aws-sigv4 "aws:amz:us-east-1:s3" \
+  --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
+  --max-time 200 \
+  "https://s3.wasabisys.com/BUCKET/speedtest-YYYYMMDDHHMMSS-N-RAND.bin"
+```
+
 ## Install
 
 **Linux (amd64):**
