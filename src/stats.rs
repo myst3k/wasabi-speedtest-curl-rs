@@ -7,6 +7,7 @@ pub struct DirectionStats {
     pub stall: u32,
     pub tmout: u32,
     pub reset: u32,
+    pub skipped: u32,
     pub err: u32,
     pub times: Vec<f64>,
     pub speeds: Vec<f64>,
@@ -21,6 +22,7 @@ impl DirectionStats {
             stall: 0,
             tmout: 0,
             reset: 0,
+            skipped: 0,
             err: 0,
             times: Vec::new(),
             speeds: Vec::new(),
@@ -36,6 +38,7 @@ impl DirectionStats {
             Status::Stall => self.stall += 1,
             Status::Tmout => self.tmout += 1,
             Status::Reset => self.reset += 1,
+            Status::Skipped => self.skipped += 1,
             Status::Rfusd | Status::HttpErr(_) | Status::CurlErr(_) => self.err += 1,
         }
         if result.status.is_success() {
@@ -47,7 +50,7 @@ impl DirectionStats {
     }
 
     pub fn total(&self) -> u32 {
-        self.ok + self.slow + self.crawl + self.stall + self.tmout + self.reset + self.err
+        self.ok + self.slow + self.crawl + self.stall + self.tmout + self.reset + self.skipped + self.err
     }
 
     pub fn success_count(&self) -> u32 {
@@ -89,6 +92,19 @@ impl DirectionStats {
             p95: percentile_val(&sorted, 95.0),
             p99: percentile_val(&sorted, 99.0),
         })
+    }
+
+    pub fn merge(&mut self, other: DirectionStats) {
+        self.ok += other.ok;
+        self.slow += other.slow;
+        self.crawl += other.crawl;
+        self.stall += other.stall;
+        self.tmout += other.tmout;
+        self.reset += other.reset;
+        self.skipped += other.skipped;
+        self.err += other.err;
+        self.times.extend(other.times);
+        self.speeds.extend(other.speeds);
     }
 }
 

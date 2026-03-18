@@ -31,6 +31,7 @@ pub enum Status {
     Tmout,
     Reset,
     Rfusd,
+    Skipped,
     HttpErr(u16),
     CurlErr(i32),
 }
@@ -45,6 +46,7 @@ impl Status {
             Status::Tmout => "TMOUT".into(),
             Status::Reset => "RESET".into(),
             Status::Rfusd => "RFUSD".into(),
+            Status::Skipped => "SKIP".into(),
             Status::HttpErr(code) => format!("H{code}"),
             Status::CurlErr(code) => format!("ERR{code}"),
         }
@@ -52,6 +54,58 @@ impl Status {
 
     pub fn is_success(&self) -> bool {
         matches!(self, Status::Ok | Status::Slow | Status::Crawl | Status::Stall)
+    }
+}
+
+pub struct CurlTimings {
+    pub time_namelookup: f64,
+    pub time_connect: f64,
+    pub time_appconnect: f64,
+    pub time_pretransfer: f64,
+    pub time_starttransfer: f64,
+    pub time_total: f64,
+    pub speed_download: f64,
+    pub speed_upload: f64,
+    pub size_download: u64,
+    pub size_upload: u64,
+    pub num_connects: u32,
+}
+
+impl CurlTimings {
+    pub fn dns(&self) -> f64 {
+        self.time_namelookup
+    }
+
+    pub fn tcp_connect(&self) -> f64 {
+        self.time_connect - self.time_namelookup
+    }
+
+    pub fn tls_handshake(&self) -> f64 {
+        self.time_appconnect - self.time_connect
+    }
+
+    pub fn server_processing(&self) -> f64 {
+        self.time_starttransfer - self.time_pretransfer
+    }
+
+    pub fn data_transfer(&self) -> f64 {
+        self.time_total - self.time_starttransfer
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            time_namelookup: 0.0,
+            time_connect: 0.0,
+            time_appconnect: 0.0,
+            time_pretransfer: 0.0,
+            time_starttransfer: 0.0,
+            time_total: 0.0,
+            speed_download: 0.0,
+            speed_upload: 0.0,
+            size_download: 0,
+            size_upload: 0,
+            num_connects: 0,
+        }
     }
 }
 
@@ -64,6 +118,7 @@ pub struct TransferResult {
     pub speed_mbs: Option<f64>,
     pub bitrate: Option<String>,
     pub cm_ref_id: Option<String>,
+    pub timings: CurlTimings,
 }
 
 pub fn format_bitrate(mb_per_sec: f64) -> String {
@@ -123,7 +178,7 @@ pub fn create_bucket(cfg: &CurlConfig) -> Result<(), String> {
     }
 }
 
-pub fn seed_upload(cfg: &CurlConfig, obj_key: &str, size_mb: u32) -> Result<(), String> {
+pub fn seed_upload(cfg: &CurlConfig, obj_key: &str, size_bytes: u64) -> Result<(), String> {
     let url = format!("{}/{}/{}", cfg.endpoint, cfg.bucket, obj_key);
     let sigv4 = format!("aws:amz:{}:s3", cfg.region);
     let user = format!("{}:{}", cfg.access_key, cfg.secret_key);
@@ -149,7 +204,7 @@ pub fn seed_upload(cfg: &CurlConfig, obj_key: &str, size_mb: u32) -> Result<(), 
         .spawn()
         .map_err(|e| format!("Failed to run curl: {e}"))?;
 
-    feed_random_stdin(child.stdin.take().unwrap(), size_mb);
+    feed_random_stdin(child.stdin.take().unwrap(), size_bytes);
 
     let output = child.wait_with_output().map_err(|e| format!("curl wait failed: {e}"))?;
     let code = String::from_utf8_lossy(&output.stdout);
@@ -164,7 +219,7 @@ pub fn run_transfer(
     cfg: &CurlConfig,
     direction: Direction,
     obj_key: &str,
-    size_mb: u32,
+    size_bytes: u64,
 ) -> TransferResult {
     let url = format!("{}/{}/{}", cfg.endpoint, cfg.bucket, obj_key);
 
@@ -172,9 +227,26 @@ pub fn run_transfer(
     let user = format!("{}:{}", cfg.access_key, cfg.secret_key);
     let timeout_str = cfg.timeout.to_string();
 
+    let write_out = [
+        "%{http_code}",
+        "%{remote_ip}",
+        "%{time_namelookup}",
+        "%{time_connect}",
+        "%{time_appconnect}",
+        "%{time_pretransfer}",
+        "%{time_starttransfer}",
+        "%{time_total}",
+        "%{speed_download}",
+        "%{speed_upload}",
+        "%{size_download}",
+        "%{size_upload}",
+        "%{num_connects}",
+    ]
+    .join("\n");
+
     let mut args: Vec<&str> = vec![
         "-s", "-o", "/dev/null",
-        "-w", "%{http_code}\n%{remote_ip}",
+        "-w", &write_out,
         "-D", "/dev/stderr",
         "-A", &cfg.user_agent,
         "--aws-sigv4", &sigv4,
@@ -202,34 +274,59 @@ pub fn run_transfer(
         .stdout(Stdio::piped())
         .spawn();
 
-    let (exit_code, http_code, remote_ip, cm_ref_id, elapsed) = match spawn_result {
+    let (exit_code, http_code, remote_ip, cm_ref_id, elapsed, timings) = match spawn_result {
         Ok(mut child) => {
             if needs_stdin {
-                feed_random_stdin(child.stdin.take().unwrap(), size_mb);
+                feed_random_stdin(child.stdin.take().unwrap(), size_bytes);
             }
             match child.wait_with_output() {
                 Ok(out) => {
                     let elapsed = start.elapsed();
                     let stdout = String::from_utf8_lossy(&out.stdout);
-                    let mut lines = stdout.lines();
-                    let http: u16 = lines.next().unwrap_or("0").trim().parse().unwrap_or(0);
-                    let ip = lines.next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+                    let lines: Vec<&str> = stdout.lines().collect();
+                    let http: u16 = lines.first().unwrap_or(&"0").trim().parse().unwrap_or(0);
+                    let ip = lines.get(1).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
                     let exit = out.status.code().unwrap_or(-1);
                     let headers = String::from_utf8_lossy(&out.stderr);
                     let cid = parse_cm_ref_id(&headers);
-                    (exit, http, ip, cid, elapsed)
+
+                    let parse_f64 = |i: usize| -> f64 {
+                        lines.get(i).unwrap_or(&"0").trim().parse().unwrap_or(0.0)
+                    };
+                    let parse_u64 = |i: usize| -> u64 {
+                        lines.get(i).unwrap_or(&"0").trim().parse().unwrap_or(0)
+                    };
+                    let parse_u32 = |i: usize| -> u32 {
+                        lines.get(i).unwrap_or(&"0").trim().parse().unwrap_or(0)
+                    };
+
+                    let timings = CurlTimings {
+                        time_namelookup: parse_f64(2),
+                        time_connect: parse_f64(3),
+                        time_appconnect: parse_f64(4),
+                        time_pretransfer: parse_f64(5),
+                        time_starttransfer: parse_f64(6),
+                        time_total: parse_f64(7),
+                        speed_download: parse_f64(8),
+                        speed_upload: parse_f64(9),
+                        size_download: parse_u64(10),
+                        size_upload: parse_u64(11),
+                        num_connects: parse_u32(12),
+                    };
+
+                    (exit, http, ip, cid, elapsed, timings)
                 }
-                Err(_) => (-1, 0u16, None, None, start.elapsed()),
+                Err(_) => (-1, 0u16, None, None, start.elapsed(), CurlTimings::empty()),
             }
         }
-        Err(_) => (-1, 0u16, None, None, start.elapsed()),
+        Err(_) => (-1, 0u16, None, None, start.elapsed(), CurlTimings::empty()),
     };
 
     let status = classify(exit_code, http_code, &elapsed, cfg);
     let (speed_mbs, bitrate) = if status.is_success() && http_code == 200 {
         let secs = elapsed.as_secs_f64();
         if secs > 0.0 {
-            let speed = size_mb as f64 / secs;
+            let speed = (size_bytes as f64 / (1024.0 * 1024.0)) / secs;
             let br = format_bitrate(speed);
             (Some(speed), Some(br))
         } else {
@@ -248,6 +345,7 @@ pub fn run_transfer(
         speed_mbs,
         bitrate,
         cm_ref_id,
+        timings,
     }
 }
 
@@ -267,8 +365,8 @@ fn parse_cm_ref_id(headers: &str) -> Option<String> {
     None
 }
 
-fn feed_random_stdin(stdin: std::process::ChildStdin, size_mb: u32) {
-    let total_bytes = size_mb as usize * 1024 * 1024;
+fn feed_random_stdin(stdin: std::process::ChildStdin, size_bytes: u64) {
+    let total_bytes = size_bytes as usize;
     std::thread::spawn(move || {
         let mut writer = std::io::BufWriter::new(stdin);
         let mut remaining = total_bytes;

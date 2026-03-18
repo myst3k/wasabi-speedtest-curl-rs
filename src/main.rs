@@ -1,8 +1,11 @@
 mod curl;
+mod influx;
+mod rolling;
 mod stats;
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 
 use chrono::Local;
 use clap::Parser;
@@ -11,9 +14,27 @@ use crossterm::ExecutableCommand;
 use envconfig::Envconfig;
 
 use curl::{CurlConfig, Direction, TransferResult, Status};
+use influx::InfluxConfig;
 use stats::DirectionStats;
 
 static STOP: AtomicBool = AtomicBool::new(false);
+
+struct RowData {
+    run: u32,
+    _thread_id: u32,
+    rid: String,
+    ts: String,
+    transfer_bytes: u64,
+    up_result: Option<TransferResult>,
+    dn_result: Option<TransferResult>,
+    up_dev: Option<rolling::Deviation>,
+    dn_dev: Option<rolling::Deviation>,
+}
+
+struct ThreadStats {
+    up: DirectionStats,
+    dn: DirectionStats,
+}
 
 #[derive(Parser)]
 #[command(
@@ -44,9 +65,14 @@ struct Cli {
     #[arg(short = 'b', long = "bucket")]
     bucket: String,
 
-    /// Wasabi region
-    #[arg(short = 'r', default_value = "us-east-1")]
-    region: String,
+    /// S3 region (used for SigV4 signing). Falls back to AWS_REGION, then AWS_DEFAULT_REGION, then us-east-1
+    #[arg(short = 'r')]
+    region: Option<String>,
+
+    /// Custom S3 endpoint URL (e.g. https://abc123.r2.cloudflarestorage.com)
+    /// Overrides the default Wasabi endpoint
+    #[arg(long = "endpoint")]
+    endpoint: Option<String>,
 
     /// Quiet mode: only print non-OK results
     #[arg(short = 'q', long = "quiet")]
@@ -55,6 +81,10 @@ struct Cli {
     /// Payload size in MB
     #[arg(short = 's', default_value = "10")]
     size_mb: u32,
+
+    /// Randomize object size between 4KB and the -s size (log-uniform distribution)
+    #[arg(long = "randomize")]
+    randomize: bool,
 
     /// Curl --max-time in seconds
     #[arg(long = "timeout", default_value = "200")]
@@ -84,9 +114,45 @@ struct Cli {
     #[arg(long = "insecure")]
     insecure: bool,
 
+    /// Instance name for identifying this probe (default: auto-generated hostname-based ID)
+    #[arg(long = "instance")]
+    instance: Option<String>,
+
+    /// Storage provider name (default: auto-detected from endpoint URL)
+    #[arg(long = "provider")]
+    provider: Option<String>,
+
+    /// Geographic market (e.g. NA, EMEA, LATAM, APAC)
+    #[arg(long = "geo")]
+    geo: Option<String>,
+
+    /// Provider-agnostic zone for cross-provider comparison (e.g. us-east, us-west, eu-central)
+    #[arg(long = "zone")]
+    zone: Option<String>,
+
+    /// Number of concurrent transfer threads
+    #[arg(short = 't', long = "threads", default_value = "1")]
+    threads: u32,
+
     /// CSV output (summary goes to stderr)
     #[arg(long = "csv")]
     csv: bool,
+
+    /// InfluxDB URL (e.g. http://localhost:8086)
+    #[arg(long = "influxdb-url")]
+    influxdb_url: Option<String>,
+
+    /// InfluxDB API token
+    #[arg(long = "influxdb-token")]
+    influxdb_token: Option<String>,
+
+    /// InfluxDB organization
+    #[arg(long = "influxdb-org", default_value = "wasabi")]
+    influxdb_org: String,
+
+    /// InfluxDB bucket
+    #[arg(long = "influxdb-bucket", default_value = "s3_diagnostics")]
+    influxdb_bucket: String,
 }
 
 #[derive(Envconfig)]
@@ -131,7 +197,14 @@ fn main() {
         }
     }
 
-    // 4. Resolve directions
+    // 4. Resolve region
+    let region = cli.region.clone().unwrap_or_else(|| {
+        std::env::var("AWS_REGION")
+            .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|_| "us-east-1".to_string())
+    });
+
+    // 5. Resolve directions
     let (do_up, do_down) = match (cli.up, cli.down) {
         (true, false) => (true, false),
         (false, true) => (false, true),
@@ -139,12 +212,21 @@ fn main() {
     };
 
     // 5. Build endpoint
-    let scheme = if cli.insecure { "http" } else { "https" };
-    let endpoint = if cli.region == "us-east-1" {
-        format!("{scheme}://s3.wasabisys.com")
+    let endpoint = if let Some(ref ep) = cli.endpoint {
+        ep.clone()
     } else {
-        format!("{scheme}://s3.{}.wasabisys.com", cli.region)
+        let scheme = if cli.insecure { "http" } else { "https" };
+        if region == "us-east-1" {
+            format!("{scheme}://s3.wasabisys.com")
+        } else {
+            format!("{scheme}://s3.{}.wasabisys.com", region)
+        }
     };
+
+    // 6. Detect provider, geo, and zone
+    let provider = cli.provider.clone().unwrap_or_else(|| detect_provider(&endpoint));
+    let zone = cli.zone.clone().or_else(|| region_to_zone(&region));
+    let geo = cli.geo.clone().or_else(|| zone.as_deref().map(|z| zone_to_geo(z)));
 
     // Build --resolve arg: "hostname:port:ip"
     let resolve = cli.resolve_ip.as_ref().map(|ip| {
@@ -164,7 +246,7 @@ fn main() {
     let cfg = CurlConfig {
         endpoint: endpoint.clone(),
         bucket: cli.bucket.clone(),
-        region: cli.region.clone(),
+        region: region.clone(),
         access_key: env_cfg.access_key,
         secret_key: env_cfg.secret_key,
         timeout: cli.timeout,
@@ -192,18 +274,43 @@ fn main() {
     }
 
     // 8. Seed upload for download-only mode
+    let max_bytes: u64 = cli.size_mb as u64 * 1024 * 1024;
     let seed_key = format!("speedtest-seed-{}MB.bin", cli.size_mb);
     if do_down && !do_up {
         print_tag("[INFO]", Color::Cyan, use_color);
-        eprintln!(" Generating & uploading {}MB payload for download tests...", cli.size_mb);
-        if let Err(e) = curl::seed_upload(&cfg, &seed_key, cli.size_mb) {
+        eprintln!(" Generating & uploading {} payload for download tests...", format_size(max_bytes));
+        if let Err(e) = curl::seed_upload(&cfg, &seed_key, max_bytes) {
             print_tag("[FAIL]", Color::Red, use_color);
             eprintln!(" Seed upload failed: {e}");
             std::process::exit(1);
         }
     }
 
-    // 9. Signal handler
+    // 9. Instance ID
+    let instance = cli.instance.clone().unwrap_or_else(|| {
+        let hostname = gethostname::gethostname()
+            .to_string_lossy()
+            .to_string();
+        let short_id = rand_hex();
+        format!("{hostname}-{short_id}")
+    });
+
+    // 10. InfluxDB setup
+    let influx = cli.influxdb_url.as_ref().map(|url| {
+        let token = cli.influxdb_token.as_deref().unwrap_or("");
+        print_tag("[INFO]", Color::Cyan, use_color);
+        eprintln!(" InfluxDB enabled: {} org={} bucket={}", url, cli.influxdb_org, cli.influxdb_bucket);
+        print_tag("[INFO]", Color::Cyan, use_color);
+        eprintln!(" Instance: {instance}");
+        InfluxConfig {
+            url: url.clone(),
+            token: token.to_string(),
+            org: cli.influxdb_org.clone(),
+            bucket: cli.influxdb_bucket.clone(),
+        }
+    });
+
+    // 10. Signal handler
     ctrlc::set_handler(|| {
         STOP.store(true, Ordering::SeqCst);
     })
@@ -228,9 +335,14 @@ fn main() {
         if use_color {
             let _ = out.execute(SetAttribute(Attribute::Bold));
         }
+        let size_str = if cli.randomize {
+            format!("4KB-{}MB random", cli.size_mb)
+        } else {
+            format!("{}MB", cli.size_mb)
+        };
         print!(
-            "Wasabi curl Speed Test — {}MB / {} / {} runs{}",
-            cli.size_mb, mode_str, count_str, quiet_str
+            "Wasabi curl Speed Test — {} / {} / {} runs{}",
+            size_str, mode_str, count_str, quiet_str
         );
         if use_color {
             let _ = out.execute(SetAttribute(Attribute::Reset));
@@ -243,68 +355,163 @@ fn main() {
         println!("Started: {}", Local::now().format("%Y-%m-%d %H:%M:%S %Z"));
         print_header(do_up, do_down);
     } else {
-        println!("run,id,timestamp,direction,time_s,speed_mb_s,bitrate,status,http_code,x-wasabi-cm-reference-id");
+        println!("run,id,timestamp,direction,time_s,speed_mb_s,bitrate,status,http_code,dns_s,tcp_connect_s,tls_handshake_s,server_processing_s,data_transfer_s,ttfb_s,time_total_s,speed_download,speed_upload,size_download,size_upload,num_connects,remote_ip,x-wasabi-cm-reference-id,deviation,zscore,rolling_mean,rolling_stddev");
     }
 
     // 11. Main loop
     let run_date = Local::now().format("%Y%m%d%H%M%S").to_string();
     let script_start = std::time::Instant::now();
+    let run_counter = Arc::new(AtomicU32::new(0));
+    let influx = Arc::new(influx);
+    let cfg = Arc::new(cfg);
+
+    let (tx, rx) = std::sync::mpsc::channel::<RowData>();
+
+    let num_threads = cli.threads.max(1);
+    let mut handles = Vec::new();
+    let up_rolling = Arc::new(std::sync::Mutex::new(rolling::RollingStats::new(100)));
+    let dn_rolling = Arc::new(std::sync::Mutex::new(rolling::RollingStats::new(100)));
+
+    for thread_id in 0..num_threads {
+        let tx = tx.clone();
+        let cfg = Arc::clone(&cfg);
+        let influx = Arc::clone(&influx);
+        let run_counter = Arc::clone(&run_counter);
+        let up_rolling = Arc::clone(&up_rolling);
+        let dn_rolling = Arc::clone(&dn_rolling);
+        let run_date = run_date.clone();
+        let seed_key = seed_key.clone();
+        let region = region.clone();
+        let instance = instance.clone();
+        let provider = provider.clone();
+        let geo = geo.clone();
+        let zone = zone.clone();
+        let count = cli.count;
+        let randomize = cli.randomize;
+
+        handles.push(std::thread::spawn(move || {
+            let mut up_stats = DirectionStats::new();
+            let mut dn_stats = DirectionStats::new();
+
+            loop {
+                if STOP.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                let run = run_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                if count > 0 && run > count {
+                    break;
+                }
+
+                let rid = rand_hex();
+                let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                let transfer_bytes = if randomize {
+                    random_size_bytes(max_bytes)
+                } else {
+                    max_bytes
+                };
+                let obj_key = format!("speedtest-{run_date}-{run}-{rid}.bin");
+
+                let mut up_result: Option<TransferResult> = None;
+                let mut dn_result: Option<TransferResult> = None;
+                let mut up_dev: Option<rolling::Deviation> = None;
+                let mut dn_dev: Option<rolling::Deviation> = None;
+
+                // Upload
+                if do_up {
+                    let r = curl::run_transfer(&cfg, Direction::Up, &obj_key, transfer_bytes);
+                    up_stats.record(&r);
+                    up_dev = if !randomize && matches!(r.status, Status::Ok) {
+                        Some(up_rolling.lock().unwrap().classify(r.elapsed.as_secs_f64()))
+                    } else {
+                        None
+                    };
+                    if let Some(ref influx) = *influx {
+                        influx.write_point(&r, Direction::Up, &region, transfer_bytes, &instance, &provider, geo.as_deref(), zone.as_deref(), up_dev.as_ref());
+                    }
+                    up_result = Some(r);
+                }
+
+                if STOP.load(Ordering::SeqCst) {
+                    let _ = tx.send(RowData {
+                        run, _thread_id: thread_id, rid, ts, transfer_bytes,
+                        up_result, dn_result, up_dev, dn_dev,
+                    });
+                    break;
+                }
+
+                // Download — skip if upload failed (object won't exist)
+                let upload_ok = up_result.as_ref().is_none_or(|r| r.http_code == 200);
+                if do_down {
+                    if upload_ok {
+                        let dn_key = if do_up {
+                            obj_key.clone()
+                        } else {
+                            seed_key.clone()
+                        };
+                        let r = curl::run_transfer(&cfg, Direction::Down, &dn_key, transfer_bytes);
+                        dn_stats.record(&r);
+                        dn_dev = if !randomize && matches!(r.status, Status::Ok) {
+                            Some(dn_rolling.lock().unwrap().classify(r.elapsed.as_secs_f64()))
+                        } else {
+                            None
+                        };
+                        if let Some(ref influx) = *influx {
+                            influx.write_point(&r, Direction::Down, &region, transfer_bytes, &instance, &provider, geo.as_deref(), zone.as_deref(), dn_dev.as_ref());
+                        }
+                        dn_result = Some(r);
+                    } else {
+                        let skipped = TransferResult {
+                            status: Status::Skipped,
+                            http_code: 0,
+                            curl_exit: 0,
+                            remote_ip: None,
+                            elapsed: std::time::Duration::ZERO,
+                            speed_mbs: None,
+                            bitrate: None,
+                            cm_ref_id: None,
+                            timings: curl::CurlTimings::empty(),
+                        };
+                        dn_stats.record(&skipped);
+                        if let Some(ref influx) = *influx {
+                            influx.write_point(&skipped, Direction::Down, &region, transfer_bytes, &instance, &provider, geo.as_deref(), zone.as_deref(), None);
+                        }
+                        dn_result = Some(skipped);
+                    }
+                }
+
+                let _ = tx.send(RowData {
+                    run, _thread_id: thread_id, rid, ts, transfer_bytes,
+                    up_result, dn_result, up_dev, dn_dev,
+                });
+
+                if STOP.load(Ordering::SeqCst) {
+                    break;
+                }
+            }
+
+            ThreadStats { up: up_stats, dn: dn_stats }
+        }));
+    }
+    drop(tx);
+
+    // Main thread: receive and print rows
+    for row in rx {
+        print_row(
+            &cli, use_color, do_up, do_down, row.run, &row.rid, &row.ts,
+            row.transfer_bytes,
+            row.up_result.as_ref(), row.dn_result.as_ref(),
+            row.up_dev.as_ref(), row.dn_dev.as_ref(),
+        );
+    }
+
+    // Collect stats from threads
     let mut up_stats = DirectionStats::new();
     let mut dn_stats = DirectionStats::new();
-    let mut run: u32 = 0;
-
-    loop {
-        if STOP.load(Ordering::SeqCst) {
-            break;
-        }
-        run += 1;
-        if cli.count > 0 && run > cli.count {
-            break;
-        }
-
-        let rid = rand_hex();
-        let ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let obj_key = format!("speedtest-{run_date}-{run}-{rid}.bin");
-
-        let mut up_result: Option<TransferResult> = None;
-        let mut dn_result: Option<TransferResult> = None;
-
-        // Upload
-        if do_up {
-            let r = curl::run_transfer(&cfg, Direction::Up, &obj_key, cli.size_mb);
-            up_stats.record(&r);
-            up_result = Some(r);
-        }
-
-        if STOP.load(Ordering::SeqCst) {
-            // Still print this row, then break after
-            print_row(
-                &cli, use_color, do_up, do_down, run, &rid, &ts,
-                up_result.as_ref(), dn_result.as_ref(),
-            );
-            break;
-        }
-
-        // Download
-        if do_down {
-            let dn_key = if do_up {
-                obj_key.clone()
-            } else {
-                seed_key.clone()
-            };
-            let r = curl::run_transfer(&cfg, Direction::Down, &dn_key, cli.size_mb);
-            dn_stats.record(&r);
-            dn_result = Some(r);
-        }
-
-        // Print row
-        print_row(
-            &cli, use_color, do_up, do_down, run, &rid, &ts,
-            up_result.as_ref(), dn_result.as_ref(),
-        );
-
-        if STOP.load(Ordering::SeqCst) {
-            break;
+    for h in handles {
+        if let Ok(stats) = h.join() {
+            up_stats.merge(stats.up);
+            dn_stats.merge(stats.dn);
         }
     }
 
@@ -350,6 +557,96 @@ fn main() {
     }
 }
 
+fn zone_to_geo(zone: &str) -> String {
+    let z = zone.to_lowercase();
+    if z.starts_with("us-") || z.starts_with("ca-") {
+        "NA".into()
+    } else if z.starts_with("sa-") || z.starts_with("br-") {
+        "LATAM".into()
+    } else if z.starts_with("eu-") || z.starts_with("me-") || z.starts_with("af-") {
+        "EMEA".into()
+    } else if z.starts_with("ap-") || z.starts_with("au-") || z.starts_with("nz-") {
+        "APAC".into()
+    } else {
+        zone.to_uppercase()
+    }
+}
+
+fn region_to_zone(region: &str) -> Option<String> {
+    let r = region.to_lowercase();
+
+    if r.starts_with("us-east") || r.starts_with("ca-central") {
+        Some("us-east".into())
+    } else if r.starts_with("us-west") {
+        Some("us-west".into())
+    } else if r.starts_with("eu-west") {
+        Some("eu-west".into())
+    } else if r.starts_with("eu-central") || r.starts_with("eu-north") || r.starts_with("eu-south") {
+        Some("eu-central".into())
+    } else if r.starts_with("ap-northeast") {
+        Some("ap-northeast".into())
+    } else if r.starts_with("ap-southeast") {
+        Some("ap-southeast".into())
+    } else if r.starts_with("ap-south") {
+        Some("ap-south".into())
+    } else if r.starts_with("ap-east") {
+        Some("ap-east".into())
+    } else if r.starts_with("me-south") || r.starts_with("me-central") {
+        Some("me".into())
+    } else if r.starts_with("af-south") {
+        Some("af-south".into())
+    } else if r.starts_with("sa-east") {
+        Some("sa-east".into())
+    } else {
+        None
+    }
+}
+
+fn detect_provider(endpoint: &str) -> String {
+    let host = endpoint
+        .strip_prefix("https://")
+        .or_else(|| endpoint.strip_prefix("http://"))
+        .unwrap_or(endpoint);
+
+    if host.contains("wasabisys.com") {
+        "wasabi".into()
+    } else if host.contains("amazonaws.com") || host.contains("aws") {
+        "aws".into()
+    } else if host.contains("storage.googleapis.com") || host.contains("gcs") {
+        "gcs".into()
+    } else if host.contains("blob.core.windows.net") || host.contains("azure") {
+        "azure".into()
+    } else if host.contains("backblazeb2.com") || host.contains("b2") {
+        "backblaze".into()
+    } else if host.contains("digitaloceanspaces.com") {
+        "digitalocean".into()
+    } else if host.contains("r2.cloudflarestorage.com") {
+        "cloudflare-r2".into()
+    } else {
+        host.split('.').next().unwrap_or("unknown").to_string()
+    }
+}
+
+const MIN_RANDOM_BYTES: u64 = 4 * 1024; // 4KB
+
+fn random_size_bytes(max_bytes: u64) -> u64 {
+    let ln_min = (MIN_RANDOM_BYTES as f64).ln();
+    let ln_max = (max_bytes as f64).ln();
+    let r: f64 = rand::random();
+    let ln_size = ln_min + r * (ln_max - ln_min);
+    ln_size.exp() as u64
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.0}KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
 fn rand_hex() -> String {
     let bytes: [u8; 4] = rand::random();
     format!("{:02x}{:02x}{:02x}{:02x}", bytes[0], bytes[1], bytes[2], bytes[3])
@@ -383,24 +680,26 @@ fn print_header(do_up: bool, do_down: bool) {
     if do_up && do_down {
         println!();
         println!(
-            "  {:<6} {:<14} {:<19} {:<10} {:>10}  {:<16} {:<5}  {:<10} {:>10}  {:<16} {:<5}",
-            "Run", "ID", "Timestamp", "UP Time", "UP MB/s", "UP Bitrate", "UP",
-            "DN Time", "DN MB/s", "DN Bitrate", "DN"
+            "  {:<6} {:<14} {:<19} {:>8} | {:<10} {:>10}  {:<16} {:<14} | {:<10} {:>10}  {:<16} {:<14}",
+            "Run", "ID", "Timestamp", "Size",
+            "UP Time", "UP MB/s", "UP Bitrate", "UP Status",
+            "DN Time", "DN MB/s", "DN Bitrate", "DN Status"
         );
         println!(
-            "  {:<6} {:<14} {:<19} {:<10} {:>10}  {:<16} {:<5}  {:<10} {:>10}  {:<16} {:<5}",
-            "---", "--------------", "-------------------", "-------", "-------", "----------", "--",
-            "-------", "-------", "----------", "--"
+            "  {:<6} {:<14} {:<19} {:>8} | {:<10} {:>10}  {:<16} {:<14} | {:<10} {:>10}  {:<16} {:<14}",
+            "---", "--------------", "-------------------", "--------",
+            "-------", "-------", "----------", "---------",
+            "-------", "-------", "----------", "---------"
         );
     } else {
         println!();
         println!(
-            "  {:<6} {:<14} {:<19} {:<10} {:>10}  {:<16} {:<5}",
-            "Run", "ID", "Timestamp", "Time", "MB/s", "Bitrate", "Status"
+            "  {:<6} {:<14} {:<19} {:>8} {:<10} {:>10}  {:<16} {:<5}",
+            "Run", "ID", "Timestamp", "Size", "Time", "MB/s", "Bitrate", "Status"
         );
         println!(
-            "  {:<6} {:<14} {:<19} {:<10} {:>10}  {:<16} {:<5}",
-            "---", "--------------", "-------------------", "-------", "-------", "----------", "------"
+            "  {:<6} {:<14} {:<19} {:>8} {:<10} {:>10}  {:<16} {:<5}",
+            "---", "--------------", "-------------------", "--------", "-------", "-------", "----------", "------"
         );
     }
 }
@@ -423,6 +722,53 @@ fn format_bitrate_col(result: &TransferResult) -> String {
         .unwrap_or_else(|| "--".into())
 }
 
+const STATUS_COL_WIDTH: usize = 14;
+
+fn print_status_with_deviation(status: &Status, dev: Option<&rolling::Deviation>, use_color: bool) {
+    let status_label = status.label();
+    let mut written = 0;
+
+    // Print status
+    if use_color {
+        let mut out = io::stdout();
+        let _ = out.execute(SetForegroundColor(status_color(status)));
+        print!("{status_label}");
+        let _ = out.execute(ResetColor);
+    } else {
+        print!("{status_label}");
+    }
+    written += status_label.len();
+
+    // Print deviation if not NORMAL
+    if let Some(dev) = dev {
+        if dev.label != "NORMAL" {
+            let (color, symbol, symbol_display_width) = match dev.label {
+                "ELEVATED" => (Color::Yellow, "↑", 1),
+                "HIGH" => (Color::Magenta, "↑↑", 2),
+                "OUTLIER" => (Color::Red, "↑↑↑", 3),
+                _ => (Color::White, "", 0),
+            };
+            let num_part = format!("{:.1}", dev.zscore);
+            let text = format!(" {symbol}{num_part}σ");
+            let display_width = 1 + symbol_display_width + num_part.len() + 1;
+            if use_color {
+                let mut out = io::stdout();
+                let _ = out.execute(SetForegroundColor(color));
+                print!("{text}");
+                let _ = out.execute(ResetColor);
+            } else {
+                print!("{text}");
+            }
+            written += display_width;
+        }
+    }
+
+    // Pad to fixed column width
+    if written < STATUS_COL_WIDTH {
+        print!("{:width$}", "", width = STATUS_COL_WIDTH - written);
+    }
+}
+
 fn print_row(
     cli: &Cli,
     use_color: bool,
@@ -431,33 +777,70 @@ fn print_row(
     run: u32,
     rid: &str,
     ts: &str,
+    transfer_bytes: u64,
     up_result: Option<&TransferResult>,
     dn_result: Option<&TransferResult>,
+    up_dev: Option<&rolling::Deviation>,
+    dn_dev: Option<&rolling::Deviation>,
 ) {
     // CSV mode
     if cli.csv {
+        let fmt_dev = |dev: Option<&rolling::Deviation>| -> String {
+            match dev {
+                Some(d) => format!("{},{:.3},{:.6},{:.6}", d.label, d.zscore, d.mean, d.stddev),
+                None => ",,,".to_string(),
+            }
+        };
         if let Some(r) = up_result {
             println!(
-                "{},{}-{},{},up,{:.3},{},{},{},{},{}",
+                "{},{}-{},{},up,{:.3},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.0},{:.0},{},{},{},{},{},{}",
                 run, run, rid, ts,
                 r.elapsed.as_secs_f64(),
                 r.speed_mbs.map(|s| format!("{s:.2}")).unwrap_or_default(),
                 r.bitrate.as_deref().unwrap_or(""),
                 r.status.label(),
                 r.http_code,
+                r.timings.dns(),
+                r.timings.tcp_connect(),
+                r.timings.tls_handshake(),
+                r.timings.server_processing(),
+                r.timings.data_transfer(),
+                r.timings.time_starttransfer,
+                r.timings.time_total,
+                r.timings.speed_download,
+                r.timings.speed_upload,
+                r.timings.size_download,
+                r.timings.size_upload,
+                r.timings.num_connects,
+                r.remote_ip.as_deref().unwrap_or(""),
                 r.cm_ref_id.as_deref().unwrap_or(""),
+                fmt_dev(up_dev),
             );
         }
         if let Some(r) = dn_result {
             println!(
-                "{},{}-{},{},down,{:.3},{},{},{},{},{}",
+                "{},{}-{},{},down,{:.3},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.0},{:.0},{},{},{},{},{},{}",
                 run, run, rid, ts,
                 r.elapsed.as_secs_f64(),
                 r.speed_mbs.map(|s| format!("{s:.2}")).unwrap_or_default(),
                 r.bitrate.as_deref().unwrap_or(""),
                 r.status.label(),
                 r.http_code,
+                r.timings.dns(),
+                r.timings.tcp_connect(),
+                r.timings.tls_handshake(),
+                r.timings.server_processing(),
+                r.timings.data_transfer(),
+                r.timings.time_starttransfer,
+                r.timings.time_total,
+                r.timings.speed_download,
+                r.timings.speed_upload,
+                r.timings.size_download,
+                r.timings.size_upload,
+                r.timings.num_connects,
+                r.remote_ip.as_deref().unwrap_or(""),
                 r.cm_ref_id.as_deref().unwrap_or(""),
+                fmt_dev(dn_dev),
             );
         }
         return;
@@ -478,6 +861,7 @@ fn print_row(
 
     let run_str = format!("#{run}");
     let id_str = format!("{run}-{rid}");
+    let size_str = format_size(transfer_bytes);
 
     if do_up && do_down {
         let (up_time, up_spd, up_br, up_st) = match up_result {
@@ -490,15 +874,14 @@ fn print_row(
         };
 
         print!(
-            "  {:<6} {:<14} {:<19} {:<10} {:>10}  {:<16} ",
-            run_str, id_str, ts, up_time, up_spd, up_br
+            "  {:<6} {:<14} {:<19} {:>8} | {:<10} {:>10}  {:<16} ",
+            run_str, id_str, ts, size_str, up_time, up_spd, up_br
         );
-        print_colored_status(&up_st, use_color);
-        print!(
-            "  {:<10} {:>10}  {:<16} ",
+        print_status_with_deviation(&up_st, up_dev, use_color);
+        print!(" | {:<10} {:>10}  {:<16} ",
             dn_time, dn_spd, dn_br
         );
-        print_colored_status(&dn_st, use_color);
+        print_status_with_deviation(&dn_st, dn_dev, use_color);
         println!();
 
         if let Some(r) = up_result {
@@ -525,10 +908,11 @@ fn print_row(
         };
 
         print!(
-            "  {:<6} {:<14} {:<19} {:<10} {:>10}  {:<16} ",
-            run_str, id_str, ts, time, spd, br
+            "  {:<6} {:<14} {:<19} {:>8} {:<10} {:>10}  {:<16} ",
+            run_str, id_str, ts, size_str, time, spd, br
         );
-        print_colored_status(&st, use_color);
+        let single_dev = if do_up { up_dev } else { dn_dev };
+        print_status_with_deviation(&st, single_dev, use_color);
         println!();
 
         if let Some(r) = result_ref {
@@ -558,18 +942,6 @@ fn print_error_detail(dir: &str, result: &TransferResult, use_color: bool) {
     println!();
 }
 
-fn print_colored_status(status: &Status, use_color: bool) {
-    let label = status.label();
-    if use_color {
-        let mut out = io::stdout();
-        let _ = out.execute(SetForegroundColor(status_color(status)));
-        print!("{:<5}", label);
-        let _ = out.execute(ResetColor);
-    } else {
-        print!("{:<5}", label);
-    }
-}
-
 fn print_direction_summary(dir_name: &str, stats: &DirectionStats, use_color: bool) {
     let pad = if dir_name == "Upload" { "  " } else { "" };
     let mut out = io::stdout();
@@ -590,14 +962,14 @@ fn print_direction_summary(dir_name: &str, stats: &DirectionStats, use_color: bo
         print!("  ");
         let _ = out.execute(SetForegroundColor(Color::Red));
         print!(
-            "{} stall  {} tmout  {} reset  {} err",
-            stats.stall, stats.tmout, stats.reset, stats.err
+            "{} stall  {} tmout  {} reset  {} skip  {} err",
+            stats.stall, stats.tmout, stats.reset, stats.skipped, stats.err
         );
         let _ = out.execute(ResetColor);
     } else {
         print!(
-            "{} ok  {} slow  {} crawl  {} stall  {} tmout  {} reset  {} err",
-            stats.ok, stats.slow, stats.crawl, stats.stall, stats.tmout, stats.reset, stats.err
+            "{} ok  {} slow  {} crawl  {} stall  {} tmout  {} reset  {} skip  {} err",
+            stats.ok, stats.slow, stats.crawl, stats.stall, stats.tmout, stats.reset, stats.skipped, stats.err
         );
     }
     println!("  ({}% success)", stats.success_pct());

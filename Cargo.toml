@@ -1,6 +1,6 @@
 [package]
 name = "wasabi-speedtest-curl"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -12,3 +12,5 @@ rand = "0.9"
 chrono = "0.4"
 dotenvy = "0.15"
 envconfig = "0.10"
+ureq = "3"
+gethostname = "1"
